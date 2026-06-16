@@ -1,0 +1,19 @@
+# Data — too big for git, regenerable from the downloaders
+data/
+*.csv
+*.parquet
+
+# Model artifacts
+*.pt
+
+# Go build output
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Spark/Jupyter cruft
+spark-warehouse/
+.DS_Store
