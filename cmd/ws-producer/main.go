@@ -1,56 +1,102 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
+	"strings"
+	"time"
 
 	"binance-streaming/internal/binance"
+	"binance-streaming/internal/kafka"
 
 	"github.com/gorilla/websocket"
 )
 
-// ws-producer connects to the Binance kline_1m WebSocket for one symbol,
-// parses each event, and (currently) prints it. The Kafka producer is the
-// next step to wire in — see internal/kafka/producer.go.
-//
-// NOTE on filtering: for kline_1m we only care about CLOSED candles
-// (IsClosed == true). But that filter is KLINE-SPECIFIC. aggTrade/bookTicker
-// have no "closed" concept, so don't make "drop unclosed" a universal
-// producer rule, or you'll silently drop all trade/depth events later.
-func main() {
-	url := "wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
+var symbols = []string{
+	"btcusdt", "ethusdt", "solusdt", "bnbusdt", "xrpusdt",
+	"adausdt", "dogeusdt", "avaxusdt", "dotusdt", "linkusdt",
+	"ltcusdt", "trxusdt", "atomusdt", "etcusdt", "filusdt",
+	"nearusdt", "uniusdt", "xlmusdt", "aptusdt", "polusdt",
+}
 
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+type rawMsg struct {
+	key   string
+	value []byte
+}
+
+// Combined stream wraps each event: {"stream":"btcusdt@kline_1s","data":{...}}
+type streamEnvelope struct {
+	Stream string          `json:"stream"`
+	Data   json.RawMessage `json:"data"`
+}
+
+func buildURL() string {
+	parts := make([]string, len(symbols))
+	for i, s := range symbols {
+		parts[i] = s + "@kline_1s"
+	}
+	return "wss://stream.binance.com:9443/stream?streams=" + strings.Join(parts, "/")
+}
+
+func main() {
+	prod := kafka.NewProducer("localhost:9092", "raw_klines")
+	defer prod.Close()
+	ctx := context.Background()
+
+	events := make(chan rawMsg, 2000) // buffer decouples socket read from Kafka send
+
+	// N worker goroutines: drain channel -> Kafka. Concurrent sends; ordering
+	// per symbol is preserved because each symbol always uses the same key.
+	for i := 0; i < 4; i++ {
+		go func() {
+			for m := range events {
+				if err := prod.Send(ctx, m.key, m.value); err != nil {
+					log.Println("kafka send error:", err)
+				}
+			}
+		}()
+	}
+
+	// reconnect loop: if the socket drops, redial
+	for {
+		if err := runConnection(events); err != nil {
+			log.Println("connection error, reconnecting in 3s:", err)
+			time.Sleep(3 * time.Second)
+		}
+	}
+}
+
+func runConnection(events chan rawMsg) error {
+	conn, _, err := websocket.DefaultDialer.Dial(buildURL(), nil)
 	if err != nil {
-		log.Fatal("dial failed:", err)
+		return err
 	}
 	defer conn.Close()
-
-	log.Println("connected, waiting for klines...")
+	log.Printf("connected, streaming %d symbols...", len(symbols))
 
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			log.Println("read error:", err)
-			return
+			return err // bubble up -> reconnect
 		}
 
-		var event binance.KlineEvent
-		if err := json.Unmarshal(message, &event); err != nil {
-			log.Println("parse error:", err)
+		var env streamEnvelope
+		if err := json.Unmarshal(message, &env); err != nil {
+			log.Println("envelope parse error:", err)
 			continue
 		}
 
-		// Only act on closed candles (real, completed data).
+		var event binance.KlineEvent
+		if err := json.Unmarshal(env.Data, &event); err != nil {
+			log.Println("kline parse error:", err)
+			continue
+		}
 		if !event.Kline.IsClosed {
 			continue
 		}
 
-		log.Printf("%s close=%s closed=%v",
-			event.Symbol, event.Kline.Close.String(), event.Kline.IsClosed)
-
-		// TODO (step 3): send raw `message` bytes to Kafka, keyed by symbol.
-		// Store the RAW bytes (not the parsed struct) so Kafka stays the
-		// source of truth and you can replay/re-feature later.
+		// forward RAW inner data bytes, keyed by symbol
+		events <- rawMsg{key: event.Symbol, value: env.Data}
 	}
 }
