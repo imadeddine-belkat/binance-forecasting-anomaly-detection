@@ -13,16 +13,6 @@ import (
 	"strings"
 )
 
-// historical-downloader pulls 12 months of 1m klines per symbol from the
-// Binance Vision public archive, verifies each file's SHA-256, unzips it,
-// and saves the CSV into data/klines/<SYMBOL>/.
-//
-// Per file (symbol x month):
-//   1. download .zip + .CHECKSUM
-//   2. verify SHA-256 against the published checksum
-//   3. unzip
-//   4. save CSV
-
 const baseURL = "https://data.binance.vision/data/spot/monthly/klines"
 
 var symbols = []string{

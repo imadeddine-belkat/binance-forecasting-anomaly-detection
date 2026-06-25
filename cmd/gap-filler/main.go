@@ -13,15 +13,6 @@ import (
 	"time"
 )
 
-// gap-filler covers the period the monthly archive hasn't published yet
-// (last archived month -> today) using the Binance REST API.
-//
-// REST returns up to 1000 klines per request, so we PAGINATE: fetch 1000,
-// advance startTime past the last row, repeat until we reach now.
-//
-// IMPORTANT: REST timestamps are in MILLISECONDS, while the archive files are
-// MICROSECONDS. The Spark batch job normalizes both to ms at load time.
-
 const restURL = "https://api.binance.com/api/v3/klines"
 
 var symbols = []string{
@@ -32,9 +23,6 @@ var symbols = []string{
 }
 
 func main() {
-	// Gap start: first ms of the first month NOT covered by the archive.
-	// Archive ran through April 2026 -> gap starts May 1, 2026.
-	// (Adjust if your archive coverage differs.)
 	gapStart := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
 	gapEnd := time.Now().UTC().UnixMilli()
 

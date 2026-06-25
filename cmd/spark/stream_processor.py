@@ -1,206 +1,215 @@
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, BooleanType, LongType
-
 from cassandra.cluster import Cluster
 from pymongo import MongoClient
-
 import json
-import urllib.request 
+import urllib.request
 import math
+import statistics
 import pandas as pd
 
-# ---- hardcoded artifacts (HAR coeffs + detector config) ----
-HAR_COEF = {"rv_15m": 0.16732474788682988,
-            "rv_1h": 0.009128281423598323,
-            "rv_24h": 0.00032560033442801447}
-HAR_INTERCEPT = 1.9270090168323285e-05
-K = 4.0
-ROLL = 288
 
-SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOGEUSDT",
-           "AVAXUSDT","DOTUSDT","LINKUSDT","POLUSDT","LTCUSDT","TRXUSDT","ATOMUSDT",
-           "UNIUSDT","NEARUSDT","APTUSDT","FILUSDT","ETCUSDT","XLMUSDT"]
+har_weight_15m = 0.17862620024636272
+har_weight_1h = 0.011214103226812332
+har_weight_24h = 0.00035420663272866257
+har_intercept = 1.896524003230036e-05
+anomaly_threshold = 4.0
+history_size = 288
 
-cass = Cluster(["cassandra"]).connect("binance")
-cass_insert = cass.prepare("""
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT",
+           "AVAXUSDT", "DOTUSDT", "LINKUSDT", "POLUSDT", "LTCUSDT", "TRXUSDT", "ATOMUSDT",
+           "UNIUSDT", "NEARUSDT", "APTUSDT", "FILUSDT", "ETCUSDT", "XLMUSDT"]
+
+
+cassandra = Cluster(["cassandra"]).connect("binance")
+save_forecast = cassandra.prepare("""
     INSERT INTO forecasts (symbol, day, event_time, close, rv_15m, forecast, vol_forecast, vol_realized, residual, zscore)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
+anomalies = MongoClient("mongodb://mongodb:27017")["binance"]["anomalies"]
 
-mongo = MongoClient("mongodb://mongodb:27017")["binance"]["anomalies"]
-print("storage connected")
 
-spark = (SparkSession.builder
-    .appName("binance-stream")
-    .config("spark.sql.session.timeZone", "UTC")
-    .getOrCreate())
+spark = SparkSession.builder.appName("binance-stream").config("spark.sql.session.timeZone", "UTC").getOrCreate()
 spark.conf.set("spark.sql.caseSensitive", "true")
 spark.sparkContext.setLogLevel("WARN")
 
-# Binance kline_1s inner "data" shape (the env.Data your producer forwards)
-kline_schema = StructType([
-    StructField("e", StringType()),          # event type
-    StructField("E", LongType()),            # event time (ms)
-    StructField("s", StringType()),          # symbol
+
+kline_format = StructType([
+    StructField("s", StringType()),
     StructField("k", StructType([
-        StructField("t", LongType()),        # kline start (ms)
-        StructField("T", LongType()),        # kline close (ms)
-        StructField("c", StringType()),      # close price
-        StructField("h", StringType()),      # high
-        StructField("l", StringType()),      # low
-        StructField("v", StringType()),      # base volume
-        StructField("V", StringType()),      # taker buy base volume
-        StructField("x", BooleanType()),     # is closed
+        StructField("T", LongType()),
+        StructField("c", StringType()),
+        StructField("h", StringType()),
+        StructField("l", StringType()),
+        StructField("v", StringType()),
+        StructField("V", StringType()),
     ])),
 ])
 
-raw = (spark.readStream
+
+live_stream = (spark.readStream
     .format("kafka")
     .option("kafka.bootstrap.servers", "kafka:29092")
     .option("subscribe", "raw_klines")
     .option("startingOffsets", "latest")
     .load())
 
-parsed = (raw
-    .select(F.from_json(F.col("value").cast("string"), kline_schema).alias("d"))
+candles = (live_stream
+    .select(F.from_json(F.col("value").cast("string"), kline_format).alias("data"))
     .select(
-        F.col("d.s").alias("symbol"),
-        (F.col("d.k.T") / 1000).cast("timestamp").alias("event_time"),
-        F.col("d.k.c").cast("double").alias("close"),
-        F.col("d.k.h").cast("double").alias("high"),
-        F.col("d.k.l").cast("double").alias("low"),
-        F.col("d.k.v").cast("double").alias("volume"),
-        F.col("d.k.V").cast("double").alias("taker_buy_base"),
+        F.col("data.s").alias("symbol"),
+        (F.col("data.k.T") / 1000).cast("timestamp").alias("event_time"),
+        F.col("data.k.c").cast("double").alias("close"),
+        F.col("data.k.h").cast("double").alias("high"),
+        F.col("data.k.l").cast("double").alias("low"),
+        F.col("data.k.v").cast("double").alias("volume"),
     ))
 
-bars_1m = (parsed
-    .withWatermark("event_time", "30 seconds")        # tolerate 30s late events
-    .groupBy(
-        F.window("event_time", "1 minute"),
-        F.col("symbol"),
-    )
+minute_bars = (candles
+    .withWatermark("event_time", "30 seconds")
+    .groupBy(F.window("event_time", "1 minute"), F.col("symbol"))
     .agg(
-        F.last("close").alias("close"),               # last price in the minute
+        F.last("close").alias("close"),
         F.max("high").alias("high"),
         F.min("low").alias("low"),
         F.sum("volume").alias("volume"),
-        F.sum("taker_buy_base").alias("taker_buy_base"),
     )
     .select(
         F.col("symbol"),
-        F.col("window.end").alias("bar_time"),        # the minute this bar closes
-        "close", "high", "low", "volume", "taker_buy_base",
+        F.col("window.end").alias("bar_time"),
+        "close", "high", "low", "volume",
     ))
 
-def fetch_24h(symbol):
-    rows = []
-    for _ in range(2):  # 1440 bars > 1000/call -> 2 calls
-        url = (f"https://api.binance.com/api/v3/klines?symbol={symbol}"
-               f"&interval=1m&limit=1000")
-        data = json.loads(urllib.request.urlopen(url, timeout=10).read())
-        rows = data  # last 1000 is enough for rv_24h≈1440? -> see note
-        break
-    df = pd.DataFrame(rows, columns=range(12))
-    df = df[[6, 4]].copy()                      # close_time(ms), close
-    df.columns = ["t", "close"]
-    df["close"] = df["close"].astype(float)
-    df["bar_time"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    return df[["bar_time", "close"]]
+
+def download_last_24h(symbol):
+    # Best-effort warm-up from REST. If a single symbol fails (network blip,
+    # rate limit, REST hiccup), return an empty buffer and let it warm up from
+    # the live stream instead of crashing the whole processor at startup.
+    try:
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=1000"
+        raw = json.loads(urllib.request.urlopen(url, timeout=10).read())
+        table = pd.DataFrame(raw, columns=range(12))[[6, 4]]
+        table.columns = ["bar_time", "close"]
+        table["close"] = table["close"].astype(float)
+        table["bar_time"] = pd.to_datetime(table["bar_time"], unit="ms", utc=True)
+        return table[["bar_time", "close"]]
+    except Exception as e:
+        print(f"warm-up failed for {symbol}: {e} (will warm up from live stream)")
+        return pd.DataFrame({"bar_time": pd.Series([], dtype="datetime64[ns, UTC]"),
+                             "close": pd.Series([], dtype="float64")})
+
 
 print("warming up buffers...")
-buffers = {s: fetch_24h(s) for s in SYMBOLS}
-hist = {s: [] for s in SYMBOLS}  # residual history for the detector
+price_history = {symbol: download_last_24h(symbol) for symbol in symbols}
+error_history = {symbol: [] for symbol in symbols}
+last_processed = {symbol: None for symbol in symbols}
 print("buffers ready")
 
-def compute_and_forecast(sym, bar_time, close):
-    buf = buffers[sym]
-    # append the new live bar
-    buf = pd.concat([buf, pd.DataFrame([{"bar_time": bar_time, "close": close}])],
-                    ignore_index=True)
-    buf = buf.drop_duplicates("bar_time").tail(1500)  # ring buffer
-    buffers[sym] = buf
-    if len(buf) < 16:
+
+def forecast_one_bar(symbol, bar_time, close):
+    if last_processed[symbol] == bar_time:
+        return None
+    last_processed[symbol] = bar_time
+
+    prices = price_history[symbol]
+    prices = pd.concat([prices, pd.DataFrame([{"bar_time": bar_time, "close": close}])], ignore_index=True)
+    prices = prices.drop_duplicates("bar_time").tail(1500)
+    price_history[symbol] = prices
+
+    if len(prices) < 16:
         return None
 
-    c = buf["close"].values
-    lr = pd.Series(c)
-    lr = (pd.Series(c) / pd.Series(c).shift(1)).apply(lambda x: math.log(x) if x and x > 0 else 0.0)
-    sq = lr ** 2
+    series = prices["close"]
+    log_return = (series / series.shift(1)).apply(lambda x: math.log(x) if x and x > 0 else 0.0)
+    squared_return = log_return ** 2
 
-    def trail_sum(n): 
-        return sq.tail(n).sum() 
-    
-    rv15, rv1h, rv24 = trail_sum(15), trail_sum(60), trail_sum(1440)
+    rv_15m = squared_return.tail(15).sum()
+    rv_1h = squared_return.tail(60).sum()
+    rv_24h = squared_return.tail(1440).sum()
 
-    if len(sq) < 16:
-        return None
+    forecast = (har_intercept
+                + har_weight_15m * math.log1p(rv_15m)
+                + har_weight_1h * math.log1p(rv_1h)
+                + har_weight_24h * math.log1p(rv_24h))
 
-    # HAR on log1p features
-    fc = (HAR_INTERCEPT
-          + HAR_COEF["rv_15m"] * math.log1p(rv15)
-          + HAR_COEF["rv_1h"]  * math.log1p(rv1h)
-          + HAR_COEF["rv_24h"] * math.log1p(rv24))
+    # Residual in log space, defined exactly as in the offline notebook
+    # (4_evaluate): log(realized RV) - log(HAR forecast). Both rv_15m and
+    # `forecast` are compared in the same space the HAR model was trained on,
+    # so this is one log on each side, not a log of a log. An eps guard keeps
+    # log() finite if either value is ever zero.
+    eps = 1e-12
+    residual = math.log(rv_15m + eps) - math.log(forecast + eps)
 
-    realized = math.log1p(rv15)       
-    resid = math.log(realized) - math.log(fc)  
+    errors = error_history[symbol]
+    errors.append(residual)
+    errors[:] = errors[-history_size:]
 
-    h = hist[sym]
-    h.append(resid)
-    h[:] = h[-ROLL:]
-    z = None
-    anomaly = False
+    zscore = None
+    is_anomaly = False
+    if len(errors) >= 30:
+        past = errors[:-1]   # exclude current point, matches notebook shift(1)
+        mean = statistics.mean(past)
+        # Sample std (ddof=1) to match pandas rolling().std() used offline.
+        std = statistics.stdev(past)
+        if std > 0:
+            zscore = (residual - mean) / std
+            is_anomaly = abs(zscore) > anomaly_threshold
 
-    vol_forecast = math.sqrt(max(math.expm1(fc), 0.0)) * 100
-    vol_realized = math.sqrt(max(rv15, 0.0)) * 100
+    vol_forecast = math.sqrt(max(math.expm1(forecast), 0.0)) * 100
+    vol_realized = math.sqrt(max(rv_15m, 0.0)) * 100
 
-    if len(h) >= 30:
-        import statistics
-        m, sd = statistics.mean(h[:-1]), statistics.pstdev(h[:-1])
-        if sd > 0:
-            z = (resid - m) / sd
-            anomaly = abs(z) > K
-    return {"symbol": sym, "bar_time": bar_time, "close": close, "rv_15m": rv15,
-            "forecast": fc, "vol_forecast": vol_forecast, "vol_realized": vol_realized,
-            "residual": resid, "zscore": z, "anomaly": anomaly}
+    return {
+        "symbol": symbol,
+        "bar_time": bar_time,
+        "close": close,
+        "rv_15m": rv_15m,
+        "forecast": forecast,
+        "vol_forecast": vol_forecast,
+        "vol_realized": vol_realized,
+        "residual": residual,
+        "zscore": zscore,
+        "is_anomaly": is_anomaly,
+    }
 
-def process_batch(batch_df, batch_id):
-    rows = batch_df.collect()
-    print(f">>> batch {batch_id}: {len(rows)} bars")
-    for r in rows:
-        try:
-            o = compute_and_forecast(r["symbol"], r["bar_time"], float(r["close"]))
-            if not o:
-                continue
 
-            # write forecast to Cassandra (every bar)
-            bt = o["bar_time"].to_pydatetime() if hasattr(o["bar_time"], "to_pydatetime") else o["bar_time"]
-            cass.execute(cass_insert, (
-                o["symbol"], bt.date(), bt, float(o["close"]),
-                float(o["rv_15m"]), float(o["forecast"]),
-                float(o["vol_forecast"]), float(o["vol_realized"]),
-                float(o["residual"]) if o["residual"] is not None else None,
-                float(o["zscore"]) if o["zscore"] is not None else None,
-            ))
+def process_minute(batch, batch_id):
+    bars = batch.collect()
+    print(f">>> batch {batch_id}: {len(bars)} bars")
 
-            # write anomaly to Mongo (only when flagged)
-            if o["anomaly"]:
-                mongo.insert_one({
-                    "symbol": o["symbol"],
-                    "event_time": bt,
-                    "close": float(r["close"]),
-                    "forecast": float(o["forecast"]),
-                    "rv_15m": float(o["rv_15m"]),
-                    "zscore": float(o["zscore"]),
-                })
-                print(f"{o['symbol']:9} z={o['zscore']:.2f}  <<< ANOMALY (saved)")
-        except Exception as e:
-            print("error:", r["symbol"], e)
+    for bar in bars:
+        result = forecast_one_bar(bar["symbol"], bar["bar_time"], float(bar["close"]))
+        if result is None:
+            continue
 
-query = (bars_1m.writeStream
-    .foreachBatch(process_batch)
+        time = result["bar_time"]
+        if hasattr(time, "to_pydatetime"):
+            time = time.to_pydatetime()
+
+        cassandra.execute(save_forecast, (
+            result["symbol"], time.date(), time, float(result["close"]),
+            float(result["rv_15m"]), float(result["forecast"]),
+            float(result["vol_forecast"]), float(result["vol_realized"]),
+            float(result["residual"]) if result["residual"] is not None else None,
+            float(result["zscore"]) if result["zscore"] is not None else None,
+        ))
+
+        if result["is_anomaly"]:
+            anomalies.insert_one({
+                "symbol": result["symbol"],
+                "event_time": time,
+                "close": float(result["close"]),
+                "forecast": float(result["forecast"]),
+                "rv_15m": float(result["rv_15m"]),
+                "zscore": float(result["zscore"]),
+            })
+            print(f"{result['symbol']:9} z={result['zscore']:.2f}  <<< ANOMALY (saved)")
+
+
+stream = (minute_bars.writeStream
+    .foreachBatch(process_minute)
     .outputMode("update")
     .trigger(processingTime="10 seconds")
     .start())
 
-query.awaitTermination()
+stream.awaitTermination()
