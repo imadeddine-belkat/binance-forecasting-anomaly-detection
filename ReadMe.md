@@ -26,7 +26,7 @@ quiet ones.
 
 ## Architecture
 
-![Architecture](docs/architecture.png)
+![Architecture](docs/arch.png)
 
 The offline path (historical download, training, evaluation) produces the model
 artifacts that the online path loads. The two paths are kept separate, following
