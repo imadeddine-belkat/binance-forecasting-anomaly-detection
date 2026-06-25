@@ -213,4 +213,4 @@ A few decisions differ between the offline and online paths, on purpose:
 
 ## Authors
 
-Imadeddine Belkat and Nawres Ben Miled — BDA5011, Bahçeşehir University.
+Imadeddine Belkat — BDA5011, Bahçeşehir University.
