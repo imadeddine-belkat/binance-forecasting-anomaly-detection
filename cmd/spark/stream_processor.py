@@ -83,9 +83,6 @@ minute_bars = (candles
 
 
 def download_last_24h(symbol):
-    # Best-effort warm-up from REST. If a single symbol fails (network blip,
-    # rate limit, REST hiccup), return an empty buffer and let it warm up from
-    # the live stream instead of crashing the whole processor at startup.
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=1000"
         raw = json.loads(urllib.request.urlopen(url, timeout=10).read())
@@ -132,12 +129,6 @@ def forecast_one_bar(symbol, bar_time, close):
                 + har_weight_15m * math.log1p(rv_15m)
                 + har_weight_1h * math.log1p(rv_1h)
                 + har_weight_24h * math.log1p(rv_24h))
-
-    # Residual in log space, defined exactly as in the offline notebook
-    # (4_evaluate): log(realized RV) - log(HAR forecast). Both rv_15m and
-    # `forecast` are compared in the same space the HAR model was trained on,
-    # so this is one log on each side, not a log of a log. An eps guard keeps
-    # log() finite if either value is ever zero.
     eps = 1e-12
     residual = math.log(rv_15m + eps) - math.log(forecast + eps)
 
