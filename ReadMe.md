@@ -26,23 +26,7 @@ quiet ones.
 
 ## Architecture
 
-```
-Binance WebSocket ──► ws-producer (Go) ──► Kafka (raw_klines)
-                                                │
-                                                ▼
-                                    stream-processor (PySpark)
-                                    ├─ aggregate to 1-min bars
-                                    ├─ compute realised variance
-                                    ├─ apply HAR-RV forecast
-                                    └─ conditional z-score detector
-                                                │
-                                 ┌──────────────┴──────────────┐
-                                 ▼                             ▼
-                         Cassandra (forecasts)        MongoDB (anomalies)
-                                 │
-                                 ▼
-                              Grafana
-```
+![Architecture](docs/architecture.png)
 
 The offline path (historical download, training, evaluation) produces the model
 artifacts that the online path loads. The two paths are kept separate, following
